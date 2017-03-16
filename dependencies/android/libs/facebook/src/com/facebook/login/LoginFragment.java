@@ -21,6 +21,7 @@
 package com.facebook.login;
 
 import android.app.Activity;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.os.Bundle;
 import android.support.annotation.Nullable;
@@ -30,8 +31,14 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 
+import com.facebook.FacebookActivity;
+import com.facebook.FacebookOperationCanceledException;
 import com.facebook.R;
-import com.facebook.internal.CallbackManagerImpl;
+import com.facebook.internal.ServerProtocol;
+import com.facebook.internal.Utility;
+
+import org.json.JSONException;
+import org.json.JSONObject;
 
 /**
  * This Fragment is a necessary part of the overall Facebook login process
@@ -42,32 +49,37 @@ import com.facebook.internal.CallbackManagerImpl;
 
 public class LoginFragment extends Fragment {
     static final String RESULT_KEY = "com.facebook.LoginFragment:Result";
+    static final String REQUEST_KEY = "com.facebook.LoginFragment:Request";
+    static final String EXTRA_REQUEST = "request";
 
-    private static final String TAG = "LoginActivityFragment";
+    private static final String TAG = "LoginFragment";
     private static final String NULL_CALLING_PKG_ERROR_MSG =
-            "Cannot call LoginActivity with a null calling package. " +
+            "Cannot call LoginFragment with a null calling package. " +
                     "This can occur if the launchMode of the caller is singleInstance.";
-    private static final String EXTRA_REQUEST = "request";
     private static final String SAVED_LOGIN_CLIENT = "loginClient";
+    private static final String SAVED_CHALLENGE = "challenge";
+    private static final int CHALLENGE_LENGTH = 20;
 
     private String callingPackage;
     private LoginClient loginClient;
     private LoginClient.Request request;
+    private boolean restarted;
+    private String expectedChallenge;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        restarted = savedInstanceState != null;
+
         if (savedInstanceState != null) {
             loginClient = savedInstanceState.getParcelable(SAVED_LOGIN_CLIENT);
             loginClient.setFragment(this);
+            expectedChallenge = savedInstanceState.getString(SAVED_CHALLENGE);
         } else {
             loginClient = new LoginClient(this);
+            expectedChallenge = Utility.generateRandomString(CHALLENGE_LENGTH);
         }
-
-        callingPackage = getActivity().getCallingActivity().getPackageName();
-        request = (LoginClient.Request)
-                getActivity().getIntent().getParcelableExtra(EXTRA_REQUEST);
 
         loginClient.setOnCompletedListener(new LoginClient.OnCompletedListener() {
             @Override
@@ -75,6 +87,18 @@ public class LoginFragment extends Fragment {
                 onLoginClientCompleted(outcome);
             }
         });
+
+        Activity activity = getActivity();
+        if (activity == null) {
+            return;
+        }
+
+        initializeCallingPackage(activity);
+        if (activity.getIntent() != null) {
+            Intent intent = activity.getIntent();
+            Bundle bundle = intent.getBundleExtra(REQUEST_KEY);
+            request = (LoginClient.Request)bundle.getParcelable(EXTRA_REQUEST);
+        }
     }
 
     @Override
@@ -90,18 +114,18 @@ public class LoginFragment extends Fragment {
 
         loginClient.setBackgroundProcessingListener(
                 new LoginClient.BackgroundProcessingListener() {
-            @Override
-            public void onBackgroundProcessingStarted() {
-                view.findViewById(
-                        R.id.com_facebook_login_activity_progress_bar).setVisibility(View.VISIBLE);
-            }
+                    @Override
+                    public void onBackgroundProcessingStarted() {
+                        view.findViewById(R.id.com_facebook_login_activity_progress_bar)
+                                .setVisibility(View.VISIBLE);
+                    }
 
-            @Override
-            public void onBackgroundProcessingStopped() {
-                view.findViewById(
-                        R.id.com_facebook_login_activity_progress_bar).setVisibility(View.GONE);
-            }
-        });
+                    @Override
+                    public void onBackgroundProcessingStopped() {
+                        view.findViewById(R.id.com_facebook_login_activity_progress_bar)
+                                .setVisibility(View.GONE);
+                    }
+                });
 
         return view;
     }
@@ -117,9 +141,12 @@ public class LoginFragment extends Fragment {
 
         Intent resultIntent = new Intent();
         resultIntent.putExtras(bundle);
-        getActivity().setResult(resultCode, resultIntent);
 
-        getActivity().finish();
+        // The activity might be detached we will send a cancel result in onDetach
+        if (isAdded()) {
+            getActivity().setResult(resultCode, resultIntent);
+            getActivity().finish();
+        }
     }
 
     @Override
@@ -134,6 +161,17 @@ public class LoginFragment extends Fragment {
             getActivity().finish();
             return;
         }
+
+        if (restarted) {
+            Activity activity = getActivity();
+            if (activity instanceof FacebookActivity
+                    && loginClient.getCurrentHandler() instanceof CustomTabLoginMethodHandler) {
+                // custom tab was closed
+                ((FacebookActivity) activity)
+                        .sendResult(null, new FacebookOperationCanceledException());
+            }
+        }
+        restarted = true;
 
         loginClient.startOrContinueAuth(request);
     }
@@ -157,11 +195,36 @@ public class LoginFragment extends Fragment {
         super.onSaveInstanceState(outState);
 
         outState.putParcelable(SAVED_LOGIN_CLIENT, loginClient);
+        outState.putString(SAVED_CHALLENGE, expectedChallenge);
     }
 
-    static Bundle populateIntentExtras(LoginClient.Request request) {
-        Bundle extras = new Bundle();
-        extras.putParcelable(EXTRA_REQUEST, request);
-        return extras;
+    private void initializeCallingPackage(final Activity activity) {
+        ComponentName componentName = activity.getCallingActivity();
+        if (componentName == null) {
+            return;
+        }
+        callingPackage = componentName.getPackageName();
+    }
+
+    public boolean validateChallengeParam(Bundle values) {
+        try {
+            String stateString = values.getString(ServerProtocol.DIALOG_PARAM_STATE);
+            if (stateString == null) {
+                return false;
+            }
+            JSONObject state = new JSONObject(stateString);
+            String challenge = state.getString(LoginLogger.EVENT_PARAM_CHALLENGE);
+            return challenge.equals(expectedChallenge);
+        } catch (JSONException e) {
+            return false;
+        }
+    }
+
+    public String getChallengeParam() {
+        return expectedChallenge;
+    }
+
+    LoginClient getLoginClient() {
+        return loginClient;
     }
 }

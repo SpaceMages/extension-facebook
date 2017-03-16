@@ -29,12 +29,19 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.TextUtils;
+import android.util.Log;
+
 import com.facebook.FacebookException;
 import com.facebook.FacebookOperationCanceledException;
 import com.facebook.FacebookSdk;
 import com.facebook.login.DefaultAudience;
 
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * com.facebook.internal is solely for the use of other packages within the Facebook SDK for
@@ -44,6 +51,8 @@ import java.util.*;
 public final class NativeProtocol {
 
     public static final int NO_PROTOCOL_AVAILABLE = -1;
+
+    private static final String TAG = NativeProtocol.class.getName();
 
     private static final String FACEBOOK_PROXY_AUTH_ACTIVITY = "com.facebook.katana.ProxyAuth";
     private static final String FACEBOOK_TOKEN_REFRESH_ACTIVITY =
@@ -70,6 +79,7 @@ public final class NativeProtocol {
     public static final int PROTOCOL_VERSION_20141028 = 20141028;
     public static final int PROTOCOL_VERSION_20141107 = 20141107; // Bucketed Result Intents
     public static final int PROTOCOL_VERSION_20141218 = 20141218;
+    public static final int PROTOCOL_VERSION_20160327 = 20160327;
 
     public static final String EXTRA_PROTOCOL_VERSION =
             "com.facebook.platform.protocol.PROTOCOL_VERSION";
@@ -212,19 +222,23 @@ public final class NativeProtocol {
     public static final String AUDIENCE_EVERYONE = "everyone";
 
     private static final String CONTENT_SCHEME = "content://";
-    private static final String PLATFORM_PROVIDER_VERSIONS = ".provider.PlatformProvider/versions";
+    private static final String PLATFORM_PROVIDER = ".provider.PlatformProvider";
+    private static final String PLATFORM_PROVIDER_VERSIONS = PLATFORM_PROVIDER + "/versions";
 
     // Columns returned by PlatformProvider
     private static final String PLATFORM_PROVIDER_VERSION_COLUMN = "version";
 
     private static abstract class NativeAppInfo {
         abstract protected String getPackage();
+        abstract protected String getLoginActivity();
 
         private static final String FBI_HASH = "a4b7452e2ed8f5f191058ca7bbfd26b0d3214bfc";
         private static final String FBL_HASH = "5e8f16062ea3cd2c4a0d547876baa6f38cabf625";
         private static final String FBR_HASH = "8a3c4b262d721acd49a4bf97d5213199c86fa2b9";
 
         private static final HashSet<String> validAppSignatureHashes = buildAppSignatureHashes();
+
+        private TreeSet<Integer> availableVersions;
 
         private static HashSet<String> buildAppSignatureHashes() {
             HashSet<String> set = new HashSet<String>();
@@ -251,14 +265,32 @@ public final class NativeProtocol {
                 return false;
             }
 
+            // just in case
+            if (packageInfo.signatures == null || packageInfo.signatures.length <= 0) {
+                return false;
+            }
+
             for (Signature signature : packageInfo.signatures) {
                 String hashedSignature = Utility.sha1hash(signature.toByteArray());
-                if (validAppSignatureHashes.contains(hashedSignature)) {
-                    return true;
+                if (!validAppSignatureHashes.contains(hashedSignature)) {
+                    return false;
                 }
             }
 
-            return false;
+            return true;
+        }
+
+        public TreeSet<Integer> getAvailableVersions() {
+            if (availableVersions == null) {
+                fetchAvailableVersions(false);
+            }
+            return availableVersions;
+        }
+
+        private synchronized void fetchAvailableVersions(boolean force) {
+            if (force || availableVersions == null) {
+                availableVersions = fetchAllAvailableProtocolVersionsForAppInfo(this);
+            }
         }
     }
 
@@ -269,6 +301,11 @@ public final class NativeProtocol {
         protected String getPackage() {
             return KATANA_PACKAGE;
         }
+
+        @Override
+        protected String getLoginActivity() {
+            return FACEBOOK_PROXY_AUTH_ACTIVITY;
+        }
     }
 
     private static class MessengerAppInfo extends NativeAppInfo {
@@ -277,6 +314,11 @@ public final class NativeProtocol {
         @Override
         protected String getPackage() {
             return MESSENGER_PACKAGE;
+        }
+
+        @Override
+        protected String getLoginActivity() {
+            return null;
         }
     }
 
@@ -287,18 +329,39 @@ public final class NativeProtocol {
         protected String getPackage() {
             return WAKIZASHI_PACKAGE;
         }
+
+        @Override
+        protected String getLoginActivity() {
+            return FACEBOOK_PROXY_AUTH_ACTIVITY;
+        }
     }
 
-    private static final NativeAppInfo FACEBOOK_APP_INFO = new KatanaAppInfo();
+    private static class FBLiteAppInfo extends NativeAppInfo {
+        static final String FBLITE_PACKAGE = "com.facebook.lite";
+        static final String FACEBOOK_LITE_ACTIVITY =
+                "com.facebook.lite.platform.LoginGDPDialogActivity";
+
+        @Override
+        protected String getPackage() {
+            return FBLITE_PACKAGE;
+        }
+
+        @Override
+        protected String getLoginActivity() {
+            return FACEBOOK_LITE_ACTIVITY;
+        }
+    }
+
     private static List<NativeAppInfo> facebookAppInfoList = buildFacebookAppList();
     private static Map<String, List<NativeAppInfo>> actionToAppInfoMap = buildActionToAppInfoMap();
+    private static AtomicBoolean protocolVersionsAsyncUpdating = new AtomicBoolean(false);
 
     private static List<NativeAppInfo> buildFacebookAppList() {
         List<NativeAppInfo> list = new ArrayList<NativeAppInfo>();
 
         // Katana needs to be the first thing in the list since it will get selected as the default
         // FACEBOOK_APP_INFO
-        list.add(FACEBOOK_APP_INFO);
+        list.add(new KatanaAppInfo());
         list.add(new WakizashiAppInfo());
 
         return list;
@@ -355,48 +418,102 @@ public final class NativeProtocol {
         return intent;
     }
 
+    public static Intent createFacebookLiteIntent(
+            Context context,
+            String applicationId,
+            Collection<String> permissions,
+            String e2e,
+            boolean isRerequest,
+            boolean isForPublish,
+            DefaultAudience defaultAudience,
+            String clientState
+    ) {
+        NativeAppInfo appInfo = new FBLiteAppInfo();
+        Intent intent = createNativeAppIntent(
+                appInfo,
+                applicationId,
+                permissions,
+                e2e,
+                isRerequest,
+                isForPublish,
+                defaultAudience,
+                clientState);
+        intent = validateActivityIntent(context, intent, appInfo);
+
+        return intent;
+    }
+
+    private static Intent createNativeAppIntent(
+            NativeAppInfo appInfo,
+            String applicationId,
+            Collection<String> permissions,
+            String e2e,
+            boolean isRerequest,
+            boolean isForPublish,
+            DefaultAudience defaultAudience,
+            String clientState
+    ) {
+        String activityName = appInfo.getLoginActivity();
+        // the NativeApp doesn't have a login activity
+        if (activityName == null) {
+            return null;
+        }
+
+        Intent intent = new Intent()
+                .setClassName(appInfo.getPackage(), activityName)
+                .putExtra(FACEBOOK_PROXY_AUTH_APP_ID_KEY, applicationId);
+
+        if (!Utility.isNullOrEmpty(permissions)) {
+            intent.putExtra(
+                    FACEBOOK_PROXY_AUTH_PERMISSIONS_KEY, TextUtils.join(",", permissions));
+        }
+        if (!Utility.isNullOrEmpty(e2e)) {
+            intent.putExtra(FACEBOOK_PROXY_AUTH_E2E_KEY, e2e);
+        }
+
+        intent.putExtra(ServerProtocol.DIALOG_PARAM_STATE, clientState);
+        intent.putExtra(
+                ServerProtocol.DIALOG_PARAM_RESPONSE_TYPE,
+                ServerProtocol.DIALOG_RESPONSE_TYPE_TOKEN_AND_SIGNED_REQUEST);
+        intent.putExtra(
+                ServerProtocol.DIALOG_PARAM_RETURN_SCOPES,
+                ServerProtocol.DIALOG_RETURN_SCOPES_TRUE);
+        if (isForPublish) {
+            intent.putExtra(
+                    ServerProtocol.DIALOG_PARAM_DEFAULT_AUDIENCE,
+                    defaultAudience.getNativeProtocolAudience());
+        }
+
+        // Override the API Version for Auth
+        intent.putExtra(
+                ServerProtocol.DIALOG_PARAM_LEGACY_OVERRIDE,
+                ServerProtocol.GRAPH_API_VERSION);
+
+        intent.putExtra(
+                ServerProtocol.DIALOG_PARAM_AUTH_TYPE,
+                ServerProtocol.DIALOG_REREQUEST_AUTH_TYPE);
+        return intent;
+    }
+
     public static Intent createProxyAuthIntent(
             Context context,
             String applicationId,
             Collection<String> permissions,
             String e2e,
             boolean isRerequest,
-            DefaultAudience defaultAudience) {
+            boolean isForPublish,
+            DefaultAudience defaultAudience,
+            String clientState) {
         for (NativeAppInfo appInfo : facebookAppInfoList) {
-            Intent intent = new Intent()
-                    .setClassName(appInfo.getPackage(), FACEBOOK_PROXY_AUTH_ACTIVITY)
-                    .putExtra(FACEBOOK_PROXY_AUTH_APP_ID_KEY, applicationId);
-
-            if (!Utility.isNullOrEmpty(permissions)) {
-                intent.putExtra(
-                        FACEBOOK_PROXY_AUTH_PERMISSIONS_KEY, TextUtils.join(",", permissions));
-            }
-            if (!Utility.isNullOrEmpty(e2e)) {
-                intent.putExtra(FACEBOOK_PROXY_AUTH_E2E_KEY, e2e);
-            }
-
-            intent.putExtra(
-                    ServerProtocol.DIALOG_PARAM_RESPONSE_TYPE,
-                    ServerProtocol.DIALOG_RESPONSE_TYPE_TOKEN_AND_SIGNED_REQUEST);
-            intent.putExtra(
-                    ServerProtocol.DIALOG_PARAM_RETURN_SCOPES,
-                    ServerProtocol.DIALOG_RETURN_SCOPES_TRUE);
-            intent.putExtra(
-                    ServerProtocol.DIALOG_PARAM_DEFAULT_AUDIENCE,
-                    defaultAudience.getNativeProtocolAudience());
-
-            // Override the API Version for Auth
-            intent.putExtra(
-                    ServerProtocol.DIALOG_PARAM_LEGACY_OVERRIDE,
-                    ServerProtocol.GRAPH_API_VERSION);
-
-            // Set the re-request auth type for requests
-            if (isRerequest) {
-                intent.putExtra(
-                        ServerProtocol.DIALOG_PARAM_AUTH_TYPE,
-                        ServerProtocol.DIALOG_REREQUEST_AUTH_TYPE);
-            }
-
+            Intent intent = createNativeAppIntent(
+                    appInfo,
+                    applicationId,
+                    permissions,
+                    e2e,
+                    isRerequest,
+                    isForPublish,
+                    defaultAudience,
+                    clientState);
             intent = validateActivityIntent(context, intent, appInfo);
 
             if (intent != null) {
@@ -427,6 +544,7 @@ public final class NativeProtocol {
     // Note: be sure this stays sorted in descending order; add new versions at the beginning
     private static final List<Integer> KNOWN_PROTOCOL_VERSIONS =
             Arrays.asList(
+                    PROTOCOL_VERSION_20160327,
                     PROTOCOL_VERSION_20141218,
                     PROTOCOL_VERSION_20141107,
                     PROTOCOL_VERSION_20141028,
@@ -687,7 +805,7 @@ public final class NativeProtocol {
     public static int getLatestAvailableProtocolVersionForService(final int minimumVersion) {
         // Services are currently always against the Facebook App
         return getLatestAvailableProtocolVersionForAppInfoList(
-                facebookAppInfoList, new int[] {minimumVersion});
+                facebookAppInfoList, new int[]{minimumVersion});
     }
 
     public static int getLatestAvailableProtocolVersionForAction(
@@ -700,6 +818,9 @@ public final class NativeProtocol {
     private static int getLatestAvailableProtocolVersionForAppInfoList(
             List<NativeAppInfo> appInfoList,
             int[] versionSpec) {
+        // Kick off an update
+        updateAllAvailableProtocolVersionsAsync();
+
         if (appInfoList == null) {
             return NO_PROTOCOL_AVAILABLE;
         }
@@ -707,7 +828,11 @@ public final class NativeProtocol {
         // Could potentially cache the NativeAppInfo to latestProtocolVersion
         for (NativeAppInfo appInfo : appInfoList) {
             int protocolVersion =
-                    getLatestAvailableProtocolVersionForAppInfo(appInfo, versionSpec);
+                    computeLatestAvailableVersionFromVersionSpec(
+                            appInfo.getAvailableVersions(),
+                            getLatestKnownVersion(),
+                            versionSpec);
+
             if (protocolVersion != NO_PROTOCOL_AVAILABLE) {
                 return protocolVersion;
             }
@@ -716,16 +841,26 @@ public final class NativeProtocol {
         return NO_PROTOCOL_AVAILABLE;
     }
 
-    private static int getLatestAvailableProtocolVersionForAppInfo(
-            NativeAppInfo appInfo,
-            int[] versionSpec) {
-        TreeSet<Integer> fbAppVersions =
-                getAllAvailableProtocolVersionsForAppInfo(appInfo);
-        return computeLatestAvailableVersionFromVersionSpec(
-                fbAppVersions, getLatestKnownVersion(), versionSpec);
+    public static void updateAllAvailableProtocolVersionsAsync() {
+        if (!protocolVersionsAsyncUpdating.compareAndSet(false, true)) {
+            return;
+        }
+
+        FacebookSdk.getExecutor().execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    for (NativeAppInfo appInfo : facebookAppInfoList) {
+                        appInfo.fetchAvailableVersions(true);
+                    }
+                } finally {
+                    protocolVersionsAsyncUpdating.set(false);
+                }
+            }
+        });
     }
 
-    private static TreeSet<Integer> getAllAvailableProtocolVersionsForAppInfo(
+    private static TreeSet<Integer> fetchAllAvailableProtocolVersionsForAppInfo(
             NativeAppInfo appInfo) {
         TreeSet<Integer> allAvailableVersions = new TreeSet<>();
 
@@ -736,11 +871,30 @@ public final class NativeProtocol {
         Uri uri = buildPlatformProviderVersionURI(appInfo);
         Cursor c = null;
         try {
-            c = contentResolver.query(uri, projection, null, null, null);
-            if (c != null) {
-                while (c.moveToNext()) {
-                    int version = c.getInt(c.getColumnIndex(PLATFORM_PROVIDER_VERSION_COLUMN));
-                    allAvailableVersions.add(version);
+            // First see if the base provider exists as a check for whether the native app is
+            // installed. We do this prior to querying, to prevent errors from being output to
+            // logcat saying that the provider was not found.
+            PackageManager pm = FacebookSdk.getApplicationContext().getPackageManager();
+            String contentProviderName = appInfo.getPackage() + PLATFORM_PROVIDER;
+            ProviderInfo pInfo = pm.resolveContentProvider(contentProviderName, 0);
+            if (pInfo != null) {
+                try {
+                    c = contentResolver.query(uri, projection, null, null, null);
+                } catch (NullPointerException|SecurityException ex) {
+                    Log.e(TAG, "Failed to query content resolver.");
+                    // Meizu devices running Android 5.0+ have a bug where they can throw a
+                    // NullPointerException when trying resolve a ContentProvider. Additionally,
+                    // rarely some 5.0+ devices have a bug which can rarely cause a
+                    // SecurityException to be thrown. This will cause a incorrect indication
+                    // of if the FB app installed but it is better then crashing.
+                    c = null;
+                }
+
+                if (c != null) {
+                    while (c.moveToNext()) {
+                        int version = c.getInt(c.getColumnIndex(PLATFORM_PROVIDER_VERSION_COLUMN));
+                        allAvailableVersions.add(version);
+                    }
                 }
             }
         } finally {
@@ -752,10 +906,6 @@ public final class NativeProtocol {
         return allAvailableVersions;
     }
 
-    /**
-     * This is public to allow for testing. Developers are discouraged from using this method, since
-     * it may change without notice.
-     */
     public static int computeLatestAvailableVersionFromVersionSpec(
             TreeSet<Integer> allAvailableFacebookAppVersions,
             int latestSdkVersion,

@@ -21,6 +21,8 @@
 package com.facebook.login;
 
 import android.content.Context;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.text.TextUtils;
 
@@ -48,6 +50,7 @@ class LoginLogger {
     static final String EVENT_PARAM_ERROR_CODE = "4_error_code";
     static final String EVENT_PARAM_ERROR_MESSAGE = "5_error_message";
     static final String EVENT_PARAM_EXTRAS = "6_extras";
+    static final String EVENT_PARAM_CHALLENGE = "7_challenge";
     static final String EVENT_EXTRAS_TRY_LOGIN_ACTIVITY = "try_login_activity";
     static final String EVENT_EXTRAS_MISSING_INTERNET_PERMISSION = "no_internet_permission";
     static final String EVENT_EXTRAS_NOT_TRIED = "not_tried";
@@ -56,14 +59,32 @@ class LoginLogger {
     static final String EVENT_EXTRAS_REQUEST_CODE = "request_code";
     static final String EVENT_EXTRAS_PERMISSIONS = "permissions";
     static final String EVENT_EXTRAS_DEFAULT_AUDIENCE = "default_audience";
+    static final String EVENT_EXTRAS_IS_REAUTHORIZE = "isReauthorize";
+    static final String EVENT_EXTRAS_FACEBOOK_VERSION = "facebookVersion";
+
+    static final String FACEBOOK_PACKAGE_NAME = "com.facebook.katana";
 
     private final AppEventsLogger appEventsLogger;
     private String applicationId;
+    private String facebookVersion;
 
     LoginLogger(Context context, String applicationId) {
         this.applicationId = applicationId;
 
         appEventsLogger = AppEventsLogger.newLogger(context, applicationId);
+
+        // Store which version of facebook is installed
+        try {
+            PackageManager packageManager = context.getPackageManager();
+            if (packageManager != null) {
+                PackageInfo facebookInfo = packageManager.getPackageInfo(FACEBOOK_PACKAGE_NAME, 0);
+                if (facebookInfo != null) {
+                    facebookVersion = facebookInfo.versionName;
+                }
+            }
+        } catch (PackageManager.NameNotFoundException e) {
+            // Do nothing, just ignore and not log
+        }
     }
 
     public String getApplicationId() {
@@ -97,6 +118,10 @@ class LoginLogger {
                     TextUtils.join(",", pendingLoginRequest.getPermissions()));
             extras.put(EVENT_EXTRAS_DEFAULT_AUDIENCE,
                     pendingLoginRequest.getDefaultAudience().toString());
+            extras.put(EVENT_EXTRAS_IS_REAUTHORIZE, pendingLoginRequest.isRerequest());
+            if (facebookVersion != null) {
+                extras.put(EVENT_EXTRAS_FACEBOOK_VERSION, facebookVersion);
+            }
             bundle.putString(EVENT_PARAM_EXTRAS, extras.toString());
         } catch (JSONException e) {
         }

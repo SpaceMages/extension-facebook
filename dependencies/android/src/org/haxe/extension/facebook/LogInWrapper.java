@@ -11,6 +11,8 @@ import com.facebook.FacebookException;
 import com.facebook.login.LoginManager;
 import com.facebook.login.LoginResult;
 
+import org.haxe.extension.Extension;
+
 public class LogInWrapper {
 	
 	static HaxeObject mHaxeLogInManager;

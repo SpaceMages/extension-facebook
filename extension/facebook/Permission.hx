@@ -109,7 +109,7 @@ class Permission
 	
 	static function onLoginError(e : String) {
 		if (mErrorCB != null)
-			mErrorCB();
+			mErrorCB(e);
 		reset();
 	}
 	

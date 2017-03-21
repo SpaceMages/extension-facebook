@@ -114,7 +114,7 @@ class Request
 		mUrlVariables.redirect = false;
 		mUrlRequest.data = mUrlVariables;
 		
-		if (mUrlRequest.method == URLRequestMethod.GET)
+		if (mUrlRequest.method != URLRequestMethod.POST)
 			mUrlRequest.url = mUrl + "?" + mUrlVariables;
 		
 		mOnLoadedCallback = onLoaded;
